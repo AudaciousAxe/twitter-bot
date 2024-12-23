@@ -3,6 +3,7 @@
 ########################################
 
 import os
+import schedule
 import time
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -10,38 +11,33 @@ import tweepy
 import time as pytime
 import sqlite3
 
-# db.py => un helper pour is_tweet_seen(conn, tweet_id), mark_tweet_seen(conn, tweet_id), init_db()
-import db  
+import db  # votre db.py si vous avez is_tweet_seen, mark_tweet_seen, etc.
 
-##################################################
+########################################
 # CONFIG
-##################################################
+########################################
 
-# Les 5 sous-actions :
+# Sous-actions :
 #   1) respond_or_comment()
 #   2) respond_or_comment()
 #   3) like_2_tweets()
 #   4) retweet_1_tweet()
 #   5) post_1_tweet()
-#
-# On met 15s entre chaque sous-action,
-# puis 5 minutes (300s) de pause APRES la 5ᵉ,
-# puis on recommence.
+# Intervalle = 15 s entre chaque sous-action pour TEST
+# + 5 min (300 s) de pause après la 5ᵉ
+# => cycle ~6 min
 
-INTERVAL_BETWEEN_SUBACTIONS = 15   # 15 secondes
-PAUSE_AFTER_CYCLE = 300           # 5 minutes
+INTERVAL_BETWEEN_SUBACTIONS = 15   # 15 secondes (pour test)
+PAUSE_AFTER_5TH_ACTION = 300       # 5 minutes
 
-# Limites journalières
 MAX_POSTS_PER_DAY = 70
 MAX_LIKES_PER_DAY = 40
 MAX_REPLIES_PER_DAY = 40
 MAX_RETWEETS_PER_DAY = 24
 
-# Short-term limit
 SHORT_TERM_LIMIT = 4
-SHORT_TERM_WINDOW = 900  # 15 minutes en sec
+SHORT_TERM_WINDOW = 900  # 15 min
 
-# Tracking (actions) pour short-term + daily
 post_actions = []
 like_actions = []
 reply_actions = []
@@ -55,22 +51,30 @@ retweets_made = 0
 BOT_IDENTITY = (
     "You are Sam Cooper, an official student at $Galaxy, one of the 3333 chosen to build "
     "a new future among the stars. You discuss crypto, AI, AI agents, NFTs, memecoins, "
-    "and you provide valuable insights, referencing $Galaxy. "
-    "You are polite, no insults, respond in English by default."
+    "crypto opportunities, and philosophical reflections about AI in crypto. "
+    "Your goal is to provide value and subtly encourage interest in @galaxyuniwtf and $Galaxy. "
+    "You are optimistic, polite, no insults. By default, respond in English."
 )
 
-# Comptes cibles (exemple)
-TARGET_ACCOUNTS = ["@account1", "@account2"]
-# Hashtags fallback
-TARGET_HASHTAGS = ["#AI","#Crypto","#Galaxy"]
+# **Hashtags** et **@** fournis initialement :
+TARGET_HASHTAGS = [
+    '#Crypto','#NFT','#IA','#GenerativeAI','#AIAgents','#Bittensor',
+    '#zerebro','#ethermage','#Agents','#ElizaAI','#ai16z','#Bitcoin','#GalaxyNews'
+]
+TARGET_ACCOUNTS = [
+    '@jeffy_eth','@0xzerebro','@solana','@base','@StargateFinance',
+    '@truth_terminal','@YumaGroup','@DCGco','@virtuals_io','@luna_virtuals',
+    '@CreatorBid','@ai16z','@punk3700','@shawmakesmagic','@apecoin',
+    '@galaxyuniwtf'
+]
 
 MIN_FOLLOWERS = 300
 MIN_LIKES = 100
 MENTION_MAX_HOURS = 4
 
-##################################################
+########################################
 # INIT .env / Tweepy / OpenAI / DB
-##################################################
+########################################
 
 load_dotenv()
 
@@ -99,25 +103,24 @@ client_twitter = tweepy.Client(
     access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
 )
 
-# Récup ID du bot (optionnel si besoin)
-bot_username = "sam_cooper_nft"  # adaptez
+# Récup ID bot (optionnel)
+bot_username = "sam_cooper_nft"
 try:
-    me_data = client_twitter.get_user(username=bot_username)
-    if me_data and me_data.data:
-        BOT_USER_ID = me_data.data.id
+    user_data = client_twitter.get_user(username=bot_username)
+    if user_data and user_data.data:
+        bot_user_id = user_data.data.id
     else:
-        BOT_USER_ID = None
-        print("Cannot retrieve bot user data.")
+        bot_user_id = None
+        print("Unable to retrieve bot user data.")
 except Exception as e:
-    print("Error retrieving bot user ID =>", e)
-    BOT_USER_ID = None
+    print(f"Error retrieving bot user ID: {e}")
+    bot_user_id = None
 
-# DB
 conn = db.init_db()
 
-##################################################
-# HELPER: OPENAI
-##################################################
+########################################
+# HELPERS
+########################################
 
 def ask_openai(prompt, max_tokens=80, temperature=0.7):
     try:
@@ -134,10 +137,6 @@ def ask_openai(prompt, max_tokens=80, temperature=0.7):
     except Exception as e:
         print("OpenAI Error:", e)
         return None
-
-##################################################
-# SHORT-TERM & DAILY UTILS
-##################################################
 
 def can_do_action(action_list, max_per_day, daily_count,
                   limit_short=SHORT_TERM_LIMIT, window=SHORT_TERM_WINDOW):
@@ -168,30 +167,25 @@ def reset_counters():
 
     print(f"[{datetime.now()}] Daily counters have been reset.")
 
-
-##################################################
-# UTILS
-##################################################
-
 def is_recent_enough(created_at, hours=24):
     if not created_at:
         return False
     now_utc = datetime.now(timezone.utc)
     delta = now_utc - created_at
-    return delta.total_seconds() < hours*3600
+    return (delta.total_seconds() < hours*3600)
 
 def contains_insult(text):
-    insults = ["con", "connard","idiot","abruti","merde","fdp","pute"]
-    return any(w in text.lower() for w in insults)
+    insults = ["con","connard","idiot","abruti","merde","fdp","pute"]
+    txt_lower = text.lower()
+    return any(i in txt_lower for i in insults)
 
-##################################################
-# SEARCH QUERIES
-##################################################
+########################################
+# BUILD QUERIES
+########################################
 
 def build_query_accounts():
     if not TARGET_ACCOUNTS:
         return None
-    # ex. "from:account1 OR from:account2 -is:retweet lang:en"
     from_list = " OR ".join([f"from:{acc.replace('@','')}" for acc in TARGET_ACCOUNTS])
     return from_list + " -is:retweet lang:en"
 
@@ -201,34 +195,31 @@ def build_query_hashtags():
     h_list = " OR ".join(TARGET_HASHTAGS)
     return h_list + " -is:retweet lang:en"
 
-
-##################################################
+########################################
 # ACTIONS
-##################################################
+########################################
 
 def respond_1_mention():
     """
-    Répondre à 1 mention <4h, if possible
+    Tente de répondre 1 mention (<4h).
     """
     global replies_made
     if replies_made >= MAX_REPLIES_PER_DAY:
         return False
-    if not BOT_USER_ID:
+    if not bot_user_id:
         return False
 
     try:
         resp = client_twitter.get_users_mentions(
-            id=BOT_USER_ID,
+            id=bot_user_id,
             max_results=5,
             tweet_fields=["created_at"]
         )
         if not resp.data:
             return False
-
         for mention in resp.data:
             if db.is_tweet_seen(conn, mention.id):
                 continue
-            # mention <4h
             if not is_recent_enough(mention.created_at, hours=MENTION_MAX_HOURS):
                 continue
             if not can_do_action(reply_actions, MAX_REPLIES_PER_DAY, replies_made):
@@ -239,8 +230,8 @@ def respond_1_mention():
 
             # ChatGPT
             prompt = (
-                f"User mentioned us:\n{mention.text}\n"
-                "Write a short reflective answer (<280 chars), referencing $Galaxy if relevant."
+                f"The user mentioned us:\n{mention.text}\n"
+                "Write a short, reflective answer (<280 chars), referencing $Galaxy if relevant."
             )
             reply_txt = ask_openai(prompt)
             if reply_txt and len(reply_txt)<=280:
@@ -255,25 +246,20 @@ def respond_1_mention():
                     print(f"[{datetime.now()}] Replied mention => {mention.id}")
                     return True
                 except Exception as e:
-                    print("Error replying mention =>", e)
+                    print(f"Error replying mention => {e}")
             else:
                 db.mark_tweet_seen(conn, mention.id)
     except Exception as e:
         print("Error respond_1_mention =>", e)
     return False
 
-
 def comment_1_tweet():
-    """
-    Commente 1 tweet
-    """
     global replies_made
     if replies_made >= MAX_REPLIES_PER_DAY:
         print("[Max replies => skip comment_1_tweet]")
         return
-
     if not can_do_action(reply_actions, MAX_REPLIES_PER_DAY, replies_made):
-        print("[Short-term or daily limit => skip comment]")
+        print("[Limit => skip comment_1_tweet]")
         return
 
     queries = []
@@ -288,8 +274,8 @@ def comment_1_tweet():
         try:
             resp = client_twitter.search_recent_tweets(
                 query=q,
-                max_results=15,
-                tweet_fields=["created_at"],
+                max_results=10,
+                tweet_fields=["created_at"]
             )
             if not resp.data:
                 continue
@@ -301,10 +287,11 @@ def comment_1_tweet():
                 if contains_insult(tw.text):
                     db.mark_tweet_seen(conn, tw.id)
                     continue
-                # On commente
+
+                # Prompt
                 prompt = (
                     f"User posted:\n{tw.text}\n"
-                    "Write a short but reflective comment (<280 chars), referencing $Galaxy if relevant."
+                    "Write a short but reflective comment <280 chars, referencing $Galaxy if relevant."
                 )
                 cmt = ask_openai(prompt)
                 if cmt and len(cmt)<=280:
@@ -326,24 +313,15 @@ def comment_1_tweet():
             print("Error in comment_1_tweet =>", e)
 
 def respond_or_comment():
-    """
-    1) Tente respond_1_mention()
-    2) Sinon comment_1_tweet()
-    """
     responded = respond_1_mention()
     if not responded:
         comment_1_tweet()
 
 def like_2_tweets():
-    """
-    Like 2 tweets
-    """
     global likes_made
     if likes_made >= MAX_LIKES_PER_DAY:
         print("[Daily like limit => skip like_2_tweets]")
         return
-
-    # On cherche sur accounts, fallback hashtags
     queries = []
     q_acc = build_query_accounts()
     if q_acc:
@@ -352,9 +330,9 @@ def like_2_tweets():
     if q_hash:
         queries.append(q_hash)
 
-    count_liked = 0
+    liked_count = 0
     for q in queries:
-        if count_liked >= 2:
+        if liked_count>=2:
             break
         try:
             resp = client_twitter.search_recent_tweets(
@@ -365,7 +343,7 @@ def like_2_tweets():
             if not resp.data:
                 continue
             for tw in resp.data:
-                if count_liked>=2:
+                if liked_count>=2:
                     break
                 if db.is_tweet_seen(conn, tw.id):
                     continue
@@ -373,13 +351,13 @@ def like_2_tweets():
                     continue
                 if not can_do_action(like_actions, MAX_LIKES_PER_DAY, likes_made):
                     return
-                # On like
+                # like
                 try:
                     client_twitter.like(tw.id)
                     likes_made += 1
                     record_action(like_actions)
                     db.mark_tweet_seen(conn, tw.id)
-                    count_liked += 1
+                    liked_count += 1
                     print(f"[{datetime.now()}] Liked => {tw.id}")
                 except Exception as e:
                     print("Error liking =>", e)
@@ -387,9 +365,6 @@ def like_2_tweets():
             print("Error like_2_tweets =>", e)
 
 def retweet_1_tweet():
-    """
-    Retweet 1
-    """
     global retweets_made
     if not can_do_action(retweet_actions, MAX_RETWEETS_PER_DAY, retweets_made):
         print("[Daily retweet limit => skip retweet_1_tweet]")
@@ -407,7 +382,7 @@ def retweet_1_tweet():
         try:
             resp = client_twitter.search_recent_tweets(
                 query=q,
-                max_results=20,
+                max_results=10,
                 tweet_fields=["created_at"]
             )
             if not resp.data:
@@ -435,24 +410,18 @@ def retweet_1_tweet():
             print("Error retweet_1_tweet =>", e)
 
 def post_1_tweet():
-    """
-    Poster un tweet
-    """
     global posts_made
     if not can_do_action(post_actions, MAX_POSTS_PER_DAY, posts_made):
         print("[Daily post limit => skip post_1_tweet]")
         return
-
     prompt = (
-        "Generate a short but thoughtful tweet (<280 chars) about AI/Crypto, "
-        "mention $Galaxy if relevant, end with a question."
+        "Generate a short tweet (<280 chars) about AI/Crypto, referencing $Galaxy, end with a question."
     )
     txt = ask_openai(prompt)
     if not txt:
         return
     if len(txt)>280:
         txt = txt[:280]
-
     try:
         client_twitter.create_tweet(text=txt)
         posts_made += 1
@@ -461,20 +430,21 @@ def post_1_tweet():
     except Exception as e:
         print("Error posting =>", e)
 
-##################################################
+########################################
 # BIG SEQUENCE
-##################################################
+########################################
 
 def big_sequence():
     """
-    5 sous-actions, 15s entre chacune, 
-    puis 5min pause, recommence en boucle:
+    1) respond_or_comment()
+    2) respond_or_comment()
+    3) like_2_tweets()
+    4) retweet_1_tweet()
+    5) post_1_tweet()
 
-      1) respond_or_comment()
-      2) respond_or_comment()
-      3) like_2_tweets()
-      4) retweet_1_tweet()
-      5) post_1_tweet()
+    => 15s entre chaque
+    => puis 5min pause
+    => on relance
     """
     print(f"\n[{datetime.now()}] START big_sequence")
 
@@ -498,16 +468,18 @@ def big_sequence():
     post_1_tweet()
     pytime.sleep(INTERVAL_BETWEEN_SUBACTIONS)
 
-    print(f"[{datetime.now()}] => 5 sub-actions done. Pause 5 min => next cycle.")
-    pytime.sleep(PAUSE_AFTER_CYCLE)
-    print(f"[{datetime.now()}] END big_sequence => restarting cycle now...")
+    print(f"[{datetime.now()}] Done 5 actions => now 5min pause before new cycle.")
+    pytime.sleep(PAUSE_AFTER_5TH_ACTION)
+    print(f"[{datetime.now()}] End of cycle => looping again...")
 
-##################################################
+########################################
 # MAIN
-##################################################
+########################################
 
 if __name__ == "__main__":
-    print(f"[{datetime.now()}] Starting Twitter Bot - short intervals (15s) + final 5min pause per cycle.\n")
+    print(f"[{datetime.now()}] Starting BOT with 5-step subactions, 15s intervals, final 5min pause.\n")
+
+    # Boucle infinie
     while True:
         big_sequence()
 
