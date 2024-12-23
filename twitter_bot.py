@@ -1,28 +1,47 @@
+########################################
+# twitter_bot.py
+########################################
+
 import os
-import schedule
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 import tweepy
 import time as pytime
 import sqlite3
 
-import db  # votre db.py dans le même dossier
+# db.py => un helper pour is_tweet_seen(conn, tweet_id), mark_tweet_seen(conn, tweet_id), init_db()
+import db  
 
-###################################
+##################################################
 # CONFIG
-###################################
+##################################################
 
-INTERVAL_BETWEEN_SUBACTIONS = 1200  # 20 min
+# Les 5 sous-actions :
+#   1) respond_or_comment()
+#   2) respond_or_comment()
+#   3) like_2_tweets()
+#   4) retweet_1_tweet()
+#   5) post_1_tweet()
+#
+# On met 15s entre chaque sous-action,
+# puis 5 minutes (300s) de pause APRES la 5ᵉ,
+# puis on recommence.
 
+INTERVAL_BETWEEN_SUBACTIONS = 15   # 15 secondes
+PAUSE_AFTER_CYCLE = 300           # 5 minutes
+
+# Limites journalières
 MAX_POSTS_PER_DAY = 70
 MAX_LIKES_PER_DAY = 40
 MAX_REPLIES_PER_DAY = 40
 MAX_RETWEETS_PER_DAY = 24
 
+# Short-term limit
 SHORT_TERM_LIMIT = 4
-SHORT_TERM_WINDOW = 900  # 15 min
+SHORT_TERM_WINDOW = 900  # 15 minutes en sec
 
+# Tracking (actions) pour short-term + daily
 post_actions = []
 like_actions = []
 reply_actions = []
@@ -36,24 +55,22 @@ retweets_made = 0
 BOT_IDENTITY = (
     "You are Sam Cooper, an official student at $Galaxy, one of the 3333 chosen to build "
     "a new future among the stars. You discuss crypto, AI, AI agents, NFTs, memecoins, "
-    "and provide valuable insights. You subtly reference $Galaxy, you are polite, no insults, "
-    "and by default you respond in English. You can also learn about new relevant accounts in AI/Crypto."
+    "and you provide valuable insights, referencing $Galaxy. "
+    "You are polite, no insults, respond in English by default."
 )
 
-# Comptes cibles initiaux
-TARGET_ACCOUNTS = [
-    "@jeffy_eth","@0xzerebro","@solana","@base","@StargateFinance",
-    "@truth_terminal","@YumaGroup","@DCGco","@virtuals_io","@luna_virtuals",
-    "@CreatorBid","@ai16z","@punk3700","@shawmakesmagic","@galaxyuniwtf"
-]
-# Hashtags cibles
-TARGET_HASHTAGS = ["#AI","#Crypto","#NFT","#AIAgents","#Bitcoin","#Galaxy"]
-
-# On stockera ici des comptes “élargis” découverts
-RELEVANT_ACCOUNTS = set()
+# Comptes cibles (exemple)
+TARGET_ACCOUNTS = ["@account1", "@account2"]
+# Hashtags fallback
+TARGET_HASHTAGS = ["#AI","#Crypto","#Galaxy"]
 
 MIN_FOLLOWERS = 300
 MIN_LIKES = 100
+MENTION_MAX_HOURS = 4
+
+##################################################
+# INIT .env / Tweepy / OpenAI / DB
+##################################################
 
 load_dotenv()
 
@@ -62,7 +79,6 @@ TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
 TWITTER_API_SECRET_KEY = os.getenv("TWITTER_API_SECRET_KEY")
 TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
 TWITTER_ACCESS_TOKEN_SECRET = os.getenv("TWITTER_ACCESS_TOKEN_SECRET")
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not all([
@@ -83,26 +99,27 @@ client_twitter = tweepy.Client(
     access_token_secret=TWITTER_ACCESS_TOKEN_SECRET
 )
 
-# Récup ID du bot
-bot_username = "sam_cooper_nft"
+# Récup ID du bot (optionnel si besoin)
+bot_username = "sam_cooper_nft"  # adaptez
 try:
-    user_data = client_twitter.get_user(username=bot_username)
-    if user_data and user_data.data:
-        bot_user_id = user_data.data.id
+    me_data = client_twitter.get_user(username=bot_username)
+    if me_data and me_data.data:
+        BOT_USER_ID = me_data.data.id
     else:
-        print("Unable to retrieve bot user data.")
-        exit(1)
+        BOT_USER_ID = None
+        print("Cannot retrieve bot user data.")
 except Exception as e:
-    print(f"Error retrieving bot user ID: {e}")
-    exit(1)
+    print("Error retrieving bot user ID =>", e)
+    BOT_USER_ID = None
 
+# DB
 conn = db.init_db()
 
-###################################
-# HELPER : OPENAI
-###################################
+##################################################
+# HELPER: OPENAI
+##################################################
 
-def ask_openai(prompt, max_tokens=120, temperature=0.7):
+def ask_openai(prompt, max_tokens=80, temperature=0.7):
     try:
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
@@ -118,9 +135,9 @@ def ask_openai(prompt, max_tokens=120, temperature=0.7):
         print("OpenAI Error:", e)
         return None
 
-###################################
-# LIMITS & DB
-###################################
+##################################################
+# SHORT-TERM & DAILY UTILS
+##################################################
 
 def can_do_action(action_list, max_per_day, daily_count,
                   limit_short=SHORT_TERM_LIMIT, window=SHORT_TERM_WINDOW):
@@ -149,103 +166,70 @@ def reset_counters():
     reply_actions.clear()
     retweet_actions.clear()
 
-    # On peut aussi reset RELEVANT_ACCOUNTS si on veut
-    RELEVANT_ACCOUNTS.clear()
-
     print(f"[{datetime.now()}] Daily counters have been reset.")
+
+
+##################################################
+# UTILS
+##################################################
 
 def is_recent_enough(created_at, hours=24):
     if not created_at:
         return False
     now_utc = datetime.now(timezone.utc)
     delta = now_utc - created_at
-    return (delta.total_seconds() < hours*3600)
+    return delta.total_seconds() < hours*3600
 
 def contains_insult(text):
-    insults = ["con","connard","idiot","abruti","merde","fdp","pute"]
-    lower = text.lower()
-    for w in insults:
-        if w in lower:
-            return True
-    return False
+    insults = ["con", "connard","idiot","abruti","merde","fdp","pute"]
+    return any(w in text.lower() for w in insults)
 
-###################################
-# SCAN TWEETS HELPER
-###################################
+##################################################
+# SEARCH QUERIES
+##################################################
 
 def build_query_accounts():
-    # On combine TARGET_ACCOUNTS + RELEVANT_ACCOUNTS
-    all_accounts = list(TARGET_ACCOUNTS) + list(RELEVANT_ACCOUNTS)
-    if not all_accounts:
+    if not TARGET_ACCOUNTS:
         return None
-    q = " OR ".join([f"from:{acc.replace('@','')}" for acc in all_accounts])
-    q += " -is:retweet lang:en"
-    return q
+    # ex. "from:account1 OR from:account2 -is:retweet lang:en"
+    from_list = " OR ".join([f"from:{acc.replace('@','')}" for acc in TARGET_ACCOUNTS])
+    return from_list + " -is:retweet lang:en"
 
 def build_query_hashtags():
     if not TARGET_HASHTAGS:
         return None
-    h = " OR ".join(TARGET_HASHTAGS)
-    return h + " -is:retweet lang:en"
+    h_list = " OR ".join(TARGET_HASHTAGS)
+    return h_list + " -is:retweet lang:en"
 
-def check_and_add_relevant_account(user_obj):
-    """
-    Si user_obj a bcp de followers, ChatGPT peut décider si on l'ajoute à RELEVANT_ACCOUNTS
-    """
-    if not getattr(user_obj, "public_metrics", None):
-        return
-    if user_obj.public_metrics["followers_count"] < 3000:
-        return
-    # On peut demander à ChatGPT s'il est pertinent de l'ajouter
-    prompt = f"""
-    We found a user with {user_obj.public_metrics['followers_count']} followers, username {user_obj.username}.
-    Are they interesting for AI/Crypto context? Respond 'yes' or 'no'.
-    """
-    dec = ask_openai(prompt, max_tokens=10)
-    if dec and "yes" in dec.lower():
-        RELEVANT_ACCOUNTS.add(f"@{user_obj.username}")
 
-###################################
-# RESPOND OR COMMENT
-###################################
-
-def respond_or_comment():
-    """
-    1) Tente de répondre à 1 mention <4h
-    2) sinon commente un tweet
-    """
-    responded = respond_1_mention()
-    if not responded:
-        comment_1_tweet()
+##################################################
+# ACTIONS
+##################################################
 
 def respond_1_mention():
     """
-    Répond 1 mention <4h
+    Répondre à 1 mention <4h, if possible
     """
     global replies_made
     if replies_made >= MAX_REPLIES_PER_DAY:
         return False
+    if not BOT_USER_ID:
+        return False
 
     try:
         resp = client_twitter.get_users_mentions(
-            id=bot_user_id,
+            id=BOT_USER_ID,
             max_results=5,
-            tweet_fields=["created_at"],
-            expansions=["author_id"],
-            user_fields=["username","public_metrics"]
+            tweet_fields=["created_at"]
         )
-        if not resp or not resp.data:
+        if not resp.data:
             return False
-        user_map = {}
-        if resp.includes and "users" in resp.includes:
-            for u in resp.includes["users"]:
-                user_map[u.id] = u
 
         for mention in resp.data:
             if db.is_tweet_seen(conn, mention.id):
                 continue
-            # On veut mention <4h
-            if not is_recent_enough(mention.created_at, hours=4):
+            # mention <4h
+            if not is_recent_enough(mention.created_at, hours=MENTION_MAX_HOURS):
                 continue
             if not can_do_action(reply_actions, MAX_REPLIES_PER_DAY, replies_made):
                 return False
@@ -253,49 +237,49 @@ def respond_1_mention():
                 db.mark_tweet_seen(conn, mention.id)
                 continue
 
-            author_username = user_map[mention.author_id].username if mention.author_id in user_map else ""
             # ChatGPT
-            mention_prompt = (
+            prompt = (
                 f"User mentioned us:\n{mention.text}\n"
-                "Write a short but deeper answer in English (<280 chars), referencing $Galaxy if relevant."
+                "Write a short reflective answer (<280 chars), referencing $Galaxy if relevant."
             )
-            reply_txt = ask_openai(mention_prompt, max_tokens=80)
+            reply_txt = ask_openai(prompt)
             if reply_txt and len(reply_txt)<=280:
                 try:
-                    final_text = (f"@{author_username} {reply_txt}" if author_username else reply_txt)
-                    client_twitter.create_tweet(text=final_text, in_reply_to_tweet_id=mention.id)
+                    client_twitter.create_tweet(
+                        text=reply_txt,
+                        in_reply_to_tweet_id=mention.id
+                    )
                     replies_made += 1
                     record_action(reply_actions)
                     db.mark_tweet_seen(conn, mention.id)
                     print(f"[{datetime.now()}] Replied mention => {mention.id}")
-
                     return True
                 except Exception as e:
-                    print(f"Error replying mention => {e}")
+                    print("Error replying mention =>", e)
             else:
                 db.mark_tweet_seen(conn, mention.id)
     except Exception as e:
         print("Error respond_1_mention =>", e)
     return False
 
+
 def comment_1_tweet():
     """
-    Commente 1 tweet => d'abord via accounts (TARGET+RELEVANT), puis fallback hashtags
-    Filtre min 300 followers, 100 likes, etc.
+    Commente 1 tweet
     """
     global replies_made
     if replies_made >= MAX_REPLIES_PER_DAY:
+        print("[Max replies => skip comment_1_tweet]")
         return
 
     if not can_do_action(reply_actions, MAX_REPLIES_PER_DAY, replies_made):
+        print("[Short-term or daily limit => skip comment]")
         return
 
-    # 1) Rechercher via accounts
     queries = []
     q_acc = build_query_accounts()
     if q_acc:
         queries.append(q_acc)
-    # 2) fallback => hashtags
     q_hash = build_query_hashtags()
     if q_hash:
         queries.append(q_hash)
@@ -305,17 +289,10 @@ def comment_1_tweet():
             resp = client_twitter.search_recent_tweets(
                 query=q,
                 max_results=15,
-                expansions=["author_id"],
-                tweet_fields=["created_at","public_metrics"],
-                user_fields=["username","public_metrics"]
+                tweet_fields=["created_at"],
             )
-            if not resp or not resp.data:
+            if not resp.data:
                 continue
-            user_map = {}
-            if resp.includes and "users" in resp.includes:
-                for u in resp.includes["users"]:
-                    user_map[u.id] = u
-
             for tw in resp.data:
                 if db.is_tweet_seen(conn, tw.id):
                     continue
@@ -324,49 +301,22 @@ def comment_1_tweet():
                 if contains_insult(tw.text):
                     db.mark_tweet_seen(conn, tw.id)
                     continue
-
-                # Check min followers / min likes
-                pm = getattr(tw, "public_metrics", None)
-                if not pm or pm["like_count"]<MIN_LIKES:
-                    continue
-                if tw.author_id not in user_map:
-                    continue
-                u_obj = user_map[tw.author_id]
-                if not getattr(u_obj, "public_metrics", None) or u_obj.public_metrics["followers_count"]<MIN_FOLLOWERS:
-                    continue
-
-                # On peut demander à ChatGPT s'il "approuve" de commenter => on skip ou comment
-                decision_prompt = f"""
-                We have a tweet from user {u_obj.username} with {u_obj.public_metrics['followers_count']} followers.
-                The tweet says:
-                {tw.text}
-
-                Should we comment or skip? respond 'comment' or 'skip'
-                """
-                dec = ask_openai(decision_prompt, max_tokens=10)
-                if not dec or "skip" in dec.lower():
-                    db.mark_tweet_seen(conn, tw.id)
-                    # On continue => on cherche un autre
-                    continue
-
-                # On commente => ChatGPT
-                comment_prompt = f"""
-                The user posted:
-                {tw.text}
-                Write a short but reflective comment in English (<280 chars), referencing $Galaxy if relevant.
-                Provide some insight about AI/Crypto, 
-                maybe mention a futuristic angle.
-                """
-                reply_txt = ask_openai(comment_prompt, max_tokens=80)
-                if reply_txt and len(reply_txt)<=280:
+                # On commente
+                prompt = (
+                    f"User posted:\n{tw.text}\n"
+                    "Write a short but reflective comment (<280 chars), referencing $Galaxy if relevant."
+                )
+                cmt = ask_openai(prompt)
+                if cmt and len(cmt)<=280:
                     try:
-                        client_twitter.create_tweet(text=reply_txt, in_reply_to_tweet_id=tw.id)
+                        client_twitter.create_tweet(
+                            text=cmt,
+                            in_reply_to_tweet_id=tw.id
+                        )
                         replies_made += 1
                         record_action(reply_actions)
                         db.mark_tweet_seen(conn, tw.id)
                         print(f"[{datetime.now()}] Commented => {tw.id}")
-                        # On check si on peut add user to relevant
-                        check_and_add_relevant_account(u_obj)
                         return
                     except Exception as e:
                         print("Error commenting =>", e)
@@ -374,21 +324,26 @@ def comment_1_tweet():
                     db.mark_tweet_seen(conn, tw.id)
         except Exception as e:
             print("Error in comment_1_tweet =>", e)
-    # si rien => skip
 
-###################################
-# LIKE 2 TWEETS
-###################################
+def respond_or_comment():
+    """
+    1) Tente respond_1_mention()
+    2) Sinon comment_1_tweet()
+    """
+    responded = respond_1_mention()
+    if not responded:
+        comment_1_tweet()
 
 def like_2_tweets():
+    """
+    Like 2 tweets
+    """
     global likes_made
     if likes_made >= MAX_LIKES_PER_DAY:
-        print("[Daily like limit reached] => skip like_2_tweets.")
+        print("[Daily like limit => skip like_2_tweets]")
         return
 
-    # On fait la même logique : accounts, puis fallback hashtags
-    # On like 2 max
-    to_like = 2
+    # On cherche sur accounts, fallback hashtags
     queries = []
     q_acc = build_query_accounts()
     if q_acc:
@@ -397,67 +352,47 @@ def like_2_tweets():
     if q_hash:
         queries.append(q_hash)
 
-    liked_count = 0
+    count_liked = 0
     for q in queries:
-        if liked_count>=to_like:
+        if count_liked >= 2:
             break
         try:
             resp = client_twitter.search_recent_tweets(
                 query=q,
                 max_results=20,
-                expansions=["author_id"],
-                tweet_fields=["public_metrics","created_at"],
-                user_fields=["public_metrics","username"]
+                tweet_fields=["created_at"]
             )
             if not resp.data:
                 continue
-            user_map = {}
-            if resp.includes and "users" in resp.includes:
-                for u in resp.includes["users"]:
-                    user_map[u.id] = u
-
             for tw in resp.data:
-                if liked_count>=to_like:
+                if count_liked>=2:
                     break
                 if db.is_tweet_seen(conn, tw.id):
                     continue
                 if not is_recent_enough(tw.created_at, hours=24):
                     continue
-
-                pm = tw.public_metrics
-                if not pm or pm["like_count"]<MIN_LIKES:
-                    continue
-                u_obj = user_map.get(tw.author_id, None)
-                if not u_obj or u_obj.public_metrics["followers_count"]<MIN_FOLLOWERS:
-                    continue
-
                 if not can_do_action(like_actions, MAX_LIKES_PER_DAY, likes_made):
-                    print("[Rate limit] can't like => skip.")
                     return
-
                 # On like
                 try:
                     client_twitter.like(tw.id)
                     likes_made += 1
                     record_action(like_actions)
                     db.mark_tweet_seen(conn, tw.id)
-                    liked_count += 1
+                    count_liked += 1
                     print(f"[{datetime.now()}] Liked => {tw.id}")
-                    check_and_add_relevant_account(u_obj)
                 except Exception as e:
                     print("Error liking =>", e)
-
         except Exception as e:
             print("Error like_2_tweets =>", e)
 
-###################################
-# RETWEET
-###################################
-
 def retweet_1_tweet():
+    """
+    Retweet 1
+    """
     global retweets_made
     if not can_do_action(retweet_actions, MAX_RETWEETS_PER_DAY, retweets_made):
-        print("[Retweet daily limit] => skip.")
+        print("[Daily retweet limit => skip retweet_1_tweet]")
         return
 
     queries = []
@@ -472,95 +407,75 @@ def retweet_1_tweet():
         try:
             resp = client_twitter.search_recent_tweets(
                 query=q,
-                max_results=15,
-                expansions=["author_id"],
-                tweet_fields=["public_metrics","created_at"],
-                user_fields=["public_metrics","username"]
+                max_results=20,
+                tweet_fields=["created_at"]
             )
             if not resp.data:
                 continue
-            user_map = {}
-            if resp.includes and "users" in resp.includes:
-                for u in resp.includes["users"]:
-                    user_map[u.id] = u
-
             for tw in resp.data:
                 if db.is_tweet_seen(conn, tw.id):
                     continue
                 if not is_recent_enough(tw.created_at, hours=24):
                     continue
-                pm = tw.public_metrics
-                if not pm or pm["like_count"]<MIN_LIKES:
-                    continue
-                u_obj = user_map.get(tw.author_id, None)
-                if not u_obj or u_obj.public_metrics["followers_count"]<MIN_FOLLOWERS:
-                    continue
                 if contains_insult(tw.text):
                     db.mark_tweet_seen(conn, tw.id)
                     continue
-
                 if not can_do_action(retweet_actions, MAX_RETWEETS_PER_DAY, retweets_made):
-                    print("[Rate limit retweet] => skip.")
                     return
-
                 try:
                     client_twitter.retweet(tw.id)
                     retweets_made += 1
                     record_action(retweet_actions)
                     db.mark_tweet_seen(conn, tw.id)
                     print(f"[{datetime.now()}] Retweeted => {tw.id}")
-                    check_and_add_relevant_account(u_obj)
                     return
                 except Exception as e:
                     print("Error retweet =>", e)
         except Exception as e:
             print("Error retweet_1_tweet =>", e)
 
-###################################
-# POST TWEET
-###################################
-
 def post_1_tweet():
+    """
+    Poster un tweet
+    """
     global posts_made
     if not can_do_action(post_actions, MAX_POSTS_PER_DAY, posts_made):
-        print("[Daily post limit] => skip post.")
+        print("[Daily post limit => skip post_1_tweet]")
         return
 
-    prompt = """
-    Generate a thoughtful tweet (<280 chars) about AI/Crypto, referencing $Galaxy if relevant, 
-    possibly mention a new event or futuristic angle. 
-    End with a question.
-    """
-    tweet_txt = ask_openai(prompt, max_tokens=80)
-    if not tweet_txt:
+    prompt = (
+        "Generate a short but thoughtful tweet (<280 chars) about AI/Crypto, "
+        "mention $Galaxy if relevant, end with a question."
+    )
+    txt = ask_openai(prompt)
+    if not txt:
         return
-    if len(tweet_txt)>280:
-        tweet_txt = tweet_txt[:280]
+    if len(txt)>280:
+        txt = txt[:280]
 
     try:
-        client_twitter.create_tweet(text=tweet_txt)
+        client_twitter.create_tweet(text=txt)
         posts_made += 1
         record_action(post_actions)
-        print(f"[{datetime.now()}] Posted => {tweet_txt}")
+        print(f"[{datetime.now()}] Posted => {txt}")
     except Exception as e:
         print("Error posting =>", e)
 
-###################################
-# BIG SEQUENCE => 5 ACTIONS
-###################################
+##################################################
+# BIG SEQUENCE
+##################################################
 
 def big_sequence():
     """
-    1) respond_or_comment()
-    2) respond_or_comment()
-    3) like_2_tweets()
-    4) retweet_1_tweet()
-    5) post_1_tweet()
-    20 min entre chaque, puis on loop.
+    5 sous-actions, 15s entre chacune, 
+    puis 5min pause, recommence en boucle:
 
-    => 1 cycle = 5 x 20 min = 100 min
+      1) respond_or_comment()
+      2) respond_or_comment()
+      3) like_2_tweets()
+      4) retweet_1_tweet()
+      5) post_1_tweet()
     """
-
     print(f"\n[{datetime.now()}] START big_sequence")
 
     # 1
@@ -583,29 +498,17 @@ def big_sequence():
     post_1_tweet()
     pytime.sleep(INTERVAL_BETWEEN_SUBACTIONS)
 
-    print(f"[{datetime.now()}] END big_sequence => loop again")
+    print(f"[{datetime.now()}] => 5 sub-actions done. Pause 5 min => next cycle.")
+    pytime.sleep(PAUSE_AFTER_CYCLE)
+    print(f"[{datetime.now()}] END big_sequence => restarting cycle now...")
 
-
-###################################
-# MAIN LOOP or SCHEDULER
-###################################
-
-def run_infinite_loop():
-    while True:
-        big_sequence()
-        # on repart direct => en ~1h40 le cycle se refait
+##################################################
+# MAIN
+##################################################
 
 if __name__ == "__main__":
-    print(f"[{datetime.now()}] Starting Twitter bot with 5-step subactions every 20 min.")
-    # On peut reset counters minuit
-    schedule.every().day.at("00:00").do(reset_counters)
-
-    # Lancement direct
+    print(f"[{datetime.now()}] Starting Twitter Bot - short intervals (15s) + final 5min pause per cycle.\n")
     while True:
         big_sequence()
-        # => 5 actions x 20 min => 100 min => on recommence
-        # ou: pass if you want manual re-lauch
-        # On relance direct
-    # si vous préférez, vous pouvez faire un scheduler event
-    # run_infinite_loop()
+
     db.close_db(conn)
